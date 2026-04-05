@@ -9,59 +9,41 @@ use formality_core::{
     judgment::{FailedJudgment, ProofTree},
     judgment_fn, Downcasted,
 };
-use itertools::Itertools;
 
-/// Converts a failed orphan judgment into anyhow for check_coherence's Fallible result.
+/// Converts a failed coherence judgment into anyhow for check_coherence's Fallible result.
 fn map_failed_judgment(e: Box<FailedJudgment>) -> anyhow::Error {
     anyhow::Error::from(*e)
 }
 
 pub(crate) fn check_coherence(program: &Program, current_crate: &Crate) -> Fallible<ProofTree> {
-    let current_crate_impls = trait_impls_in_crate(current_crate);
-
-    // Reject duplicate impls in this crate otherwise the overlap cartesian product would treat
-    // an impl as overlapping with itself.
-    for (impl_a, i) in current_crate_impls.iter().zip(0..) {
-        if current_crate_impls[i + 1..].contains(impl_a) {
-            bail!("duplicate impl in current crate: {:?}", impl_a);
-        }
-    }
-
-    let orphan_tree = check_coherence_orphans_judgment(program.clone(), current_crate.clone())
+    check_coherence_judgment(program.clone(), current_crate.clone())
         .check_proven()
-        .map_err(map_failed_judgment)?;
-
-    // Each current-crate impl vs every impl in the program overlap.
-    let all_crate_impls = all_trait_impls(program);
-    let mut children = vec![orphan_tree];
-    for pair in overlap_pairs(&current_crate_impls, &all_crate_impls) {
-        children.push(overlap_check_impl(
-            program.clone(),
-            pair.0.clone(),
-            pair.1.clone(),
-        )?);
-    }
-
-    Ok(ProofTree::new(
-        format!("check_coherence({:?})", current_crate.id),
-        None,
-        children,
-    ))
+        .map_err(map_failed_judgment)
 }
 
 judgment_fn! {
-    fn check_coherence_orphans_judgment(program: Program, current_crate: Crate) => () {
+    fn check_coherence_judgment(program: Program, current_crate: Crate) => () {
         debug(program, current_crate)
 
         (
             (let current_crate_impls: Vec<TraitImpl> = trait_impls_in_crate(current_crate))
-            (let current_crate_neg_impls: Vec<NegTraitImpl> = neg_trait_impls_in_crate(current_crate))
-            (for_all(impl_a in current_crate_impls)
-                (orphan_check(program, impl_a.clone()) => ()))
-            (for_all(impl_a in current_crate_neg_impls)
-                (orphan_check_neg(program, impl_a.clone()) => ()))
-            --- ("check_coherence_orphans")
-            (check_coherence_orphans_judgment(program, current_crate) => ())
+            (let _ = ensure_no_duplicate_impls(current_crate_impls)?)
+            (let all_crate_impls: Vec<TraitImpl> = all_trait_impls(&program))
+            (let pair_indices: Vec<(usize, usize)> = overlap_pair_indices(current_crate_impls, &all_crate_impls))
+            (for_all(k in 0..pair_indices.len())
+                (let (i, j) = pair_indices[k])
+                (let _overlap: ProofTree = overlap_check_impl(
+                    program.clone(),
+                    current_crate_impls[*i].clone(),
+                    all_crate_impls[*j].clone(),
+                )?)
+            )
+            (for_all(idx in 0..current_crate_impls.len())
+                (orphan_check(&program, current_crate_impls[idx].clone()) => ()))
+            (for_all(impl_a in neg_trait_impls_in_crate(current_crate))
+                (orphan_check_neg(&program, impl_a) => ()))
+            --- ("check_coherence")
+            (check_coherence_judgment(program, current_crate) => ())
         )
     }
 }
@@ -93,6 +75,34 @@ judgment_fn! {
             (orphan_check_neg(program, impl_a) => ())
         )
     }
+}
+
+/// Reject duplicate trait impls in the current crate so overlap pairing cannot match an impl with itself.
+fn ensure_no_duplicate_impls(impls: &[TraitImpl]) -> Fallible<()> {
+    for (i, impl_a) in impls.iter().enumerate() {
+        if impls[i + 1..].contains(impl_a) {
+            bail!("duplicate impl in current crate: {:?}", impl_a);
+        }
+    }
+    Ok(())
+}
+
+/// Indices (i, j) into current_crate_impls and all_crate_impls that need an overlap check.
+fn overlap_pair_indices(
+    current_crate_impls: &[TraitImpl],
+    all_crate_impls: &[TraitImpl],
+) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for i in 0..current_crate_impls.len() {
+        for j in 0..all_crate_impls.len() {
+            let impl_a = &current_crate_impls[i];
+            let impl_b = &all_crate_impls[j];
+            if impl_a != impl_b && impl_a.trait_id() == impl_b.trait_id() {
+                out.push((i, j));
+            }
+        }
+    }
+    out
 }
 
 /// Two impls of the same trait prove they do not overlap or report impls may overlap.
@@ -207,19 +217,5 @@ fn all_trait_impls(program: &Program) -> Vec<TraitImpl> {
         .program()
         .items_from_all_crates()
         .downcasted()
-        .collect()
-}
-
-/// Pairs with the same trait and distinct impls.
-fn overlap_pairs(
-    current_crate_impls: &[TraitImpl],
-    all_crate_impls: &[TraitImpl],
-) -> Vec<(TraitImpl, TraitImpl)> {
-    current_crate_impls
-        .iter()
-        .cartesian_product(all_crate_impls)
-        .filter(|(impl_a, impl_b)| impl_a != impl_b)
-        .filter(|(impl_a, impl_b)| impl_a.trait_id() == impl_b.trait_id())
-        .map(|(impl_a, impl_b)| (impl_a.clone(), impl_b.clone()))
         .collect()
 }
